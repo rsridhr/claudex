@@ -8,8 +8,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
+	"strconv"
 	"syscall"
+	"unicode/utf16"
 
 	"github.com/tanq16/claudex/internal/model"
 )
@@ -20,9 +21,50 @@ type RawHistoryEntry struct {
 	Raw    []byte
 }
 
-// Claude's on-disk project dir: every "/" in the abs path becomes "-" (e.g. /Users/foo -> -Users-foo).
+// projectPathLimit is Claude Code's cap on an encoded project directory name.
+// Longer names are truncated and given a hash suffix so they stay unique.
+const projectPathLimit = 200
+
+// EncodeProjectPath reproduces Claude Code's project directory name for a working
+// directory. The reference implementation is:
+//
+//	function KP(q){ let K = q.replace(/[^a-zA-Z0-9]/g,"-")
+//	                if (K.length <= 200) return K
+//	                return `${K.slice(0,200)}-${Math.abs(hash(q)).toString(36)}` }
+//	function hash(e){ let t=0; for(let r=0;r<e.length;r++) t=(t<<5)-t+e.charCodeAt(r)|0; return t }
+//
+// Two details matter. The regex carries no /u flag, so it substitutes per UTF-16
+// code unit: an astral-plane rune is two units and becomes two hyphens. And the
+// hash is taken over the ORIGINAL path, not the encoded one.
 func EncodeProjectPath(absPath string) string {
-	return strings.ReplaceAll(absPath, "/", "-")
+	units := utf16.Encode([]rune(absPath))
+	encoded := make([]byte, len(units))
+	for i, u := range units {
+		switch {
+		case u >= 'a' && u <= 'z', u >= 'A' && u <= 'Z', u >= '0' && u <= '9':
+			encoded[i] = byte(u)
+		default:
+			encoded[i] = '-'
+		}
+	}
+	if len(encoded) <= projectPathLimit {
+		return string(encoded)
+	}
+	return string(encoded[:projectPathLimit]) + "-" + strconv.FormatInt(absPathHash(units), 36)
+}
+
+// absPathHash is Java-style string hashing over UTF-16 code units with int32
+// wraparound, returned as a non-negative value. int64 is used for the result so
+// that negating math.MinInt32 does not wrap back to itself, matching Math.abs.
+func absPathHash(units []uint16) int64 {
+	var h int32
+	for _, u := range units {
+		h = h*31 + int32(u)
+	}
+	if h < 0 {
+		return -int64(h)
+	}
+	return int64(h)
 }
 
 func ProjectDir(configDir, projectPath string) string {
